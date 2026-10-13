@@ -1,0 +1,60 @@
+// uh uh uh
+void _start(void) {
+  __asm__ volatile(
+      "lui a0, 0x11002\n"
+      "la t0, uhandler\n"
+      "csrw mtvec, t0\n"
+      // ecall M mode
+      "li a7, 0xff\n"
+      "ecall\n"
+      "li t0, 0x31\n"
+      "sw t0, 0(a0)\n"
+      // umode drop
+      "li t0, 0x1234\n"
+      "csrw mscratch, t0\n"
+      "li t0, 0x8\n"
+      "csrw mstatus, t0\n"
+      "la t0, ucode\n"
+      "csrw mepc, t0\n"
+      "mret\n"
+      "j .\n"
+      "ucode:\n"
+      "li a7, 57\n"
+      "ecall\n"
+      "li t0, 0x31\n"
+      "sw t0, 0(a0)\n"
+      "j .\n"
+      "uhandler:\n"
+      "csrr t0, mcause\n"
+      "li t1, 8\n"
+      "beq t0, t1, ucause8\n"
+      "li t1, 11\n"
+      "bne t0, t1, ufail\n"
+      // m ecall
+      "csrr t0, mstatus\n"
+      "srli t0, t0, 11\n"
+      "andi t0, t0, 3\n"
+      "li t1, 3\n"
+      "bne t0, t1, ufail\n"
+      "j uadvance\n"
+      "ucause8:\n"
+      // u ecall
+      "csrr t0, mstatus\n"
+      "srli t0, t0, 11\n"
+      "andi t0, t0, 3\n"
+      "bnez t0, ufail\n"
+      "uadvance:\n"
+      "csrr t0, mepc\n"
+      "addi t0, t0, 4\n"
+      "csrw mepc, t0\n"
+      "li t0, 0x31\n"
+      "sw t0, 0(a0)\n"
+      "mret\n"
+      "j .\n"
+      "ufail:\n"
+      "li t0, 0x30\n"
+      "sw t0, 0(a0)\n"
+      "j .\n");
+  for (;;)
+    ;
+}

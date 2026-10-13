@@ -1,0 +1,385 @@
+diff --git a/drivers/mailbox/mtk-cmdq-mailbox.c b/drivers/mailbox/mtk-cmdq-mailbox.c
+index e523c84b4808..7d0370d9e480 100644
+--- a/drivers/mailbox/mtk-cmdq-mailbox.c
++++ b/drivers/mailbox/mtk-cmdq-mailbox.c
+@@ -18,9 +18,18 @@
+ #include <linux/mailbox_controller.h>
+ #include <linux/mailbox/mtk-cmdq-mailbox.h>
+ #include <linux/of.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
+ 
+ #define CMDQ_MBOX_AUTOSUSPEND_DELAY_MS	100
+ 
++#define CMDQ_TEST_THREAD		0
++#define CMDQ_TEST_BUF_SIZE		(16 * 1024 * 1024)
++#define CMDQ_TEST_POLL_MS		100
++
+ #define CMDQ_OP_CODE_MASK		(0xff << CMDQ_OP_CODE_SHIFT)
+ #define CMDQ_NUM_CMD(t)			(t->cmd_buf_size / CMDQ_INST_SIZE)
+ 
+@@ -90,6 +99,14 @@ struct cmdq {
+ 	struct cmdq_thread	*thread;
+ 	struct clk_bulk_data	*clocks;
+ 	bool			suspended;
++	/* /dev/cmdq */
++	void			*test_virt;
++	dma_addr_t		test_phys;
++	size_t			test_size;
++	bool			test_running;
++	struct delayed_work	test_work;
++	struct mutex		test_lock;
++	struct miscdevice	test_misc;
+ };
+ 
+ struct gce_plat {
+@@ -245,6 +262,293 @@ static void cmdq_thread_disable(struct cmdq *cmdq, struct cmdq_thread *thread)
+ 	writel(CMDQ_THR_DISABLED, thread->base + CMDQ_THR_ENABLE_TASK);
+ }
+ 
++static void cmdq_test_waker(struct cmdq *cmdq)
++{
++	struct cmdq_thread *thread = &cmdq->thread[CMDQ_TEST_THREAD];
++	u32 gce_addr = cmdq_convert_gce_addr(cmdq->test_phys, cmdq->pdata);
++	u32 gce_end = cmdq_convert_gce_addr(cmdq->test_phys + cmdq->test_size,
++					    cmdq->pdata);
++
++	writel(gce_addr, thread->base + CMDQ_THR_CURR_ADDR);
++	writel(gce_end, thread->base + CMDQ_THR_END_ADDR);
++	writel(thread->priority, thread->base + CMDQ_THR_PRIORITY);
++	writel(CMDQ_THR_IRQ_EN, thread->base + CMDQ_THR_IRQ_ENABLE);
++	wmb();
++	writel(CMDQ_THR_ENABLED, thread->base + CMDQ_THR_ENABLE_TASK);
++}
++
++static void cmdq_test_poll(struct work_struct *work)
++{
++	struct cmdq *cmdq = container_of(to_delayed_work(work),
++					 struct cmdq, test_work);
++	struct cmdq_thread *thread;
++	unsigned long flags;
++	bool busy, enabled;
++
++	mutex_lock(&cmdq->test_lock);
++	if (!cmdq->test_running)
++		goto unlock;
++
++	thread = &cmdq->thread[CMDQ_TEST_THREAD];
++	spin_lock_irqsave(&thread->chan->lock, flags);
++	busy = !list_empty(&thread->task_busy_list);
++	spin_unlock_irqrestore(&thread->chan->lock, flags);
++	enabled = !!(readl(thread->base + CMDQ_THR_ENABLE_TASK) & CMDQ_THR_ENABLED);
++
++	if (enabled) {
++		/* ok */
++	} else if (busy) {
++		dev_warn_once(cmdq->mbox.dev, "WHAT\n");
++	} else {
++		cmdq_test_waker(cmdq);
++	}
++
++	if (cmdq->test_running)
++		schedule_delayed_work(&cmdq->test_work,
++				      msecs_to_jiffies(CMDQ_TEST_POLL_MS));
++unlock:
++	mutex_unlock(&cmdq->test_lock);
++}
++
++static ssize_t cmdq_test_stop(struct cmdq *cmdq, size_t count)
++{
++	mutex_lock(&cmdq->test_lock);
++	if (cmdq->test_running) {
++		struct cmdq_thread *thread = &cmdq->thread[CMDQ_TEST_THREAD];
++
++		cmdq_thread_disable(cmdq, thread);
++		cmdq->test_running = false;
++		dev_info(cmdq->mbox.dev, "cmdq raw test stopped\n");
++		mutex_unlock(&cmdq->test_lock);
++		pm_runtime_mark_last_busy(cmdq->mbox.dev);
++		pm_runtime_put_autosuspend(cmdq->mbox.dev);
++	} else {
++		mutex_unlock(&cmdq->test_lock);
++		dev_info(cmdq->mbox.dev, "cmdq raw test not running\n");
++	}
++	return count;
++}
++
++static ssize_t cmdq_test_write(struct file *filp, const char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	struct miscdevice *misc = filp->private_data;
++	struct cmdq *cmdq = container_of(misc, struct cmdq, test_misc);
++	struct cmdq_thread *thread;
++	unsigned long flags;
++	bool busy;
++	u32 gce_addr, gce_end;
++	int ret;
++
++	if (count == 0)
++		return 0;
++
++	if (count <= 5) {
++		char kstop[5];
++
++		if (!copy_from_user(kstop, buf, count) &&
++		    !memcmp(kstop, "stop", 4)) {
++			cancel_delayed_work_sync(&cmdq->test_work);
++			return cmdq_test_stop(cmdq, count);
++		}
++	}
++
++	if (count % CMDQ_INST_SIZE)
++		return -EINVAL;
++	if (count > CMDQ_TEST_BUF_SIZE)
++		return -E2BIG;
++
++	cancel_delayed_work_sync(&cmdq->test_work);
++
++	if (mutex_lock_interruptible(&cmdq->test_lock))
++		return -ERESTARTSYS;
++
++	thread = &cmdq->thread[CMDQ_TEST_THREAD];
++
++	spin_lock_irqsave(&thread->chan->lock, flags);
++	busy = !list_empty(&thread->task_busy_list);
++	spin_unlock_irqrestore(&thread->chan->lock, flags);
++	if (busy) {
++		dev_err(cmdq->mbox.dev, "test thread %u busy with mailbox job\n",
++			CMDQ_TEST_THREAD);
++		if (cmdq->test_running) {
++			cmdq->test_running = false;
++			mutex_unlock(&cmdq->test_lock);
++			pm_runtime_mark_last_busy(cmdq->mbox.dev);
++			pm_runtime_put_autosuspend(cmdq->mbox.dev);
++		} else {
++			mutex_unlock(&cmdq->test_lock);
++		}
++		return -EBUSY;
++	}
++
++	if (copy_from_user(cmdq->test_virt, buf, count)) {
++		if (cmdq->test_running) {
++			cmdq_thread_disable(cmdq, thread);
++			cmdq->test_running = false;
++			mutex_unlock(&cmdq->test_lock);
++			pm_runtime_mark_last_busy(cmdq->mbox.dev);
++			pm_runtime_put_autosuspend(cmdq->mbox.dev);
++		} else {
++			mutex_unlock(&cmdq->test_lock);
++		}
++		return -EFAULT;
++	}
++	wmb();
++
++	if (!cmdq->test_running) {
++		ret = pm_runtime_get_sync(cmdq->mbox.dev);
++		if (ret < 0) {
++			pm_runtime_put_noidle(cmdq->mbox.dev);
++			mutex_unlock(&cmdq->test_lock);
++			return ret;
++		}
++	}
++
++	ret = cmdq_thread_reset(cmdq, thread);
++	if (ret < 0) {
++		cmdq_thread_disable(cmdq, thread);
++		if (!cmdq->test_running) {
++			mutex_unlock(&cmdq->test_lock);
++			pm_runtime_mark_last_busy(cmdq->mbox.dev);
++			pm_runtime_put_autosuspend(cmdq->mbox.dev);
++		} else {
++			cmdq->test_running = false;
++			mutex_unlock(&cmdq->test_lock);
++			pm_runtime_mark_last_busy(cmdq->mbox.dev);
++			pm_runtime_put_autosuspend(cmdq->mbox.dev);
++		}
++		return ret;
++	}
++
++	cmdq->test_size = count;
++	gce_addr = cmdq_convert_gce_addr(cmdq->test_phys, cmdq->pdata);
++	gce_end = cmdq_convert_gce_addr(cmdq->test_phys + count, cmdq->pdata);
++
++	dev_info(cmdq->mbox.dev,
++		 "start gce: %zu bytes (%zu insns)\n", count, count / CMDQ_INST_SIZE);
++
++	cmdq_test_waker(cmdq);
++	cmdq->test_running = true;
++	schedule_delayed_work(&cmdq->test_work,
++			      msecs_to_jiffies(CMDQ_TEST_POLL_MS));
++	mutex_unlock(&cmdq->test_lock);
++
++	return count;
++}
++
++static ssize_t cmdq_test_read(struct file *filp, char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	struct miscdevice *misc = filp->private_data;
++	struct cmdq *cmdq = container_of(misc, struct cmdq, test_misc);
++	struct cmdq_thread *thread;
++	char kbuf[192];
++	int len;
++	u32 curr, end, enable, irq_stat;
++	bool running;
++	size_t size;
++	int ret;
++
++	if (CMDQ_TEST_THREAD >= cmdq->pdata->thread_nr)
++		return -ENODEV;
++	thread = &cmdq->thread[CMDQ_TEST_THREAD];
++
++	ret = pm_runtime_get_sync(cmdq->mbox.dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(cmdq->mbox.dev);
++		return ret;
++	}
++	curr = readl(thread->base + CMDQ_THR_CURR_ADDR);
++	end = readl(thread->base + CMDQ_THR_END_ADDR);
++	enable = readl(thread->base + CMDQ_THR_ENABLE_TASK);
++	irq_stat = readl(thread->base + CMDQ_THR_IRQ_STATUS);
++	mutex_lock(&cmdq->test_lock);
++	running = cmdq->test_running;
++	size = cmdq->test_size;
++	mutex_unlock(&cmdq->test_lock);
++	pm_runtime_mark_last_busy(cmdq->mbox.dev);
++	pm_runtime_put_autosuspend(cmdq->mbox.dev);
++
++	len = scnprintf(kbuf, sizeof(kbuf),
++			"thread%u running=%d size=%zu curr %#x end %#x enable %#x irq %#x\n",
++			CMDQ_TEST_THREAD, running, size,
++			curr, end, enable, irq_stat);
++	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
++}
++
++static const struct file_operations cmdq_test_fops = {
++	.owner = THIS_MODULE,
++	.write = cmdq_test_write,
++	.read = cmdq_test_read,
++	.llseek = default_llseek,
++};
++
++static int cmdq_test_init(struct cmdq *cmdq)
++{
++	int ret;
++
++	mutex_init(&cmdq->test_lock);
++	INIT_DELAYED_WORK(&cmdq->test_work, cmdq_test_poll);
++	cmdq->test_running = false;
++	cmdq->test_size = 0;
++	cmdq->test_virt = dma_alloc_coherent(cmdq->mbox.dev, CMDQ_TEST_BUF_SIZE,
++					     &cmdq->test_phys, GFP_KERNEL);
++	if (!cmdq->test_virt) {
++		dev_err(cmdq->mbox.dev, "failed to alloc raw test buffer\n");
++		return -ENOMEM;
++	}
++
++	cmdq->test_misc.minor = MISC_DYNAMIC_MINOR;
++	cmdq->test_misc.name = "cmdq";
++	cmdq->test_misc.fops = &cmdq_test_fops;
++	cmdq->test_misc.parent = cmdq->mbox.dev;
++	cmdq->test_misc.mode = 0666;
++
++	ret = misc_register(&cmdq->test_misc);
++	if (ret) {
++		dev_err(cmdq->mbox.dev, "failed to register /dev/cmdq: %d\n", ret);
++		dma_free_coherent(cmdq->mbox.dev, CMDQ_TEST_BUF_SIZE,
++				  cmdq->test_virt, cmdq->test_phys);
++		cmdq->test_virt = NULL;
++		return ret;
++	}
++
++	dev_info(cmdq->mbox.dev, "cmdq test iface ready, pa: %pad\n", &cmdq->test_phys);
++	return 0;
++}
++
++static void cmdq_test_deinit(struct cmdq *cmdq)
++{
++	if (!cmdq->test_virt && !cmdq->test_misc.this_device)
++		return;
++	cancel_delayed_work_sync(&cmdq->test_work);
++	mutex_lock(&cmdq->test_lock);
++	if (cmdq->test_running && cmdq->thread &&
++	    CMDQ_TEST_THREAD < cmdq->pdata->thread_nr) {
++		cmdq_thread_disable(cmdq, &cmdq->thread[CMDQ_TEST_THREAD]);
++		cmdq->test_running = false;
++		mutex_unlock(&cmdq->test_lock);
++		pm_runtime_mark_last_busy(cmdq->mbox.dev);
++		pm_runtime_put_autosuspend(cmdq->mbox.dev);
++	} else {
++		bool was_running = cmdq->test_running;
++
++		cmdq->test_running = false;
++		mutex_unlock(&cmdq->test_lock);
++		if (was_running) {
++			pm_runtime_mark_last_busy(cmdq->mbox.dev);
++			pm_runtime_put_autosuspend(cmdq->mbox.dev);
++		}
++	}
++	misc_deregister(&cmdq->test_misc);
++	if (cmdq->test_virt) {
++		dma_free_coherent(cmdq->mbox.dev, CMDQ_TEST_BUF_SIZE,
++				  cmdq->test_virt, cmdq->test_phys);
++		cmdq->test_virt = NULL;
++	}
++}
++
+ /* notify GCE to re-fetch commands by setting GCE thread PC */
+ static void cmdq_thread_invalidate_fetched_data(struct cmdq_thread *thread)
+ {
+@@ -438,6 +742,8 @@ static void cmdq_remove(struct platform_device *pdev)
+ {
+ 	struct cmdq *cmdq = platform_get_drvdata(pdev);
+ 
++	cmdq_test_deinit(cmdq);
++
+ 	if (!IS_ENABLED(CONFIG_PM))
+ 		cmdq_runtime_suspend(&pdev->dev);
+ 
+@@ -742,6 +1048,8 @@ static int cmdq_probe(struct platform_device *pdev)
+ 				CMDQ_THR_SIZE * i;
+ 		INIT_LIST_HEAD(&cmdq->thread[i].task_busy_list);
+ 		cmdq->mbox.chans[i].con_priv = (void *)&cmdq->thread[i];
++
++		cmdq->thread[i].chan = &cmdq->mbox.chans[i];
+ 	}
+ 
+ 	platform_set_drvdata(pdev, cmdq);
+@@ -777,6 +1085,12 @@ static int cmdq_probe(struct platform_device *pdev)
+ 		return err;
+ 	}
+ 
++	err = cmdq_test_init(cmdq);
++	if (err) {
++		cmdq_test_deinit(cmdq);
++		return err;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -787,6 +1101,13 @@ static const struct dev_pm_ops cmdq_pm_ops = {
+ 			   cmdq_runtime_resume, NULL)
+ };
+ 
++static const struct gce_plat gce_plat_mt6768 = {
++	.thread_nr = 16,
++	.shift = 0,
++	.control_by_sw = false,
++	.gce_num = 1
++};
++
+ static const struct gce_plat gce_plat_mt6779 = {
+ 	.thread_nr = 24,
+ 	.shift = 3,
+@@ -848,6 +1169,7 @@ static const struct gce_plat gce_plat_mt8196 = {
+ };
+ 
+ static const struct of_device_id cmdq_of_ids[] = {
++	{.compatible = "mediatek,mt6768-gce", .data = (void *)&gce_plat_mt6768},
+ 	{.compatible = "mediatek,mt6779-gce", .data = (void *)&gce_plat_mt6779},
+ 	{.compatible = "mediatek,mt8173-gce", .data = (void *)&gce_plat_mt8173},
+ 	{.compatible = "mediatek,mt8183-gce", .data = (void *)&gce_plat_mt8183},

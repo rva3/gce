@@ -1,0 +1,44 @@
+#define UART ((volatile unsigned int *)0x11002000)
+void _start(void) {
+  volatile unsigned a = 0x12345678, b = 0xdeadbeef;
+  volatile unsigned c;
+  c = a + b;
+  UART[0] = c;
+  c = a - b;
+  UART[0] = c;
+  c = a ^ b;
+  UART[0] = c;
+  c = a | b;
+  UART[0] = c;
+  c = a & b;
+  UART[0] = c;
+  c = a << 3;
+  UART[0] = c;
+  c = a >> 3;
+  UART[0] = c;
+  c = ((int)a >> 3);
+  UART[0] = c;
+  c = (a < b);
+  UART[0] = c;
+  c = ((int)a < (int)b);
+  UART[0] = c;
+  c = a + 0x123;
+  UART[0] = c;
+  c = (a < 100);
+  UART[0] = c;
+  volatile unsigned char *p = (unsigned char *)0x40001000;
+  volatile unsigned short *q = (unsigned short *)0x40001000;
+  *p = 0x41;
+  UART[0] = *p;
+  *q = 0x4241;
+  UART[0] = *q;
+  c = *(volatile unsigned char *)0x40001000;
+  UART[0] = c;
+  c = *(volatile signed char *)0x40001000;
+  UART[0] = c;
+  c = *(volatile unsigned short *)0x40001000;
+  UART[0] = c;
+  c = *(volatile signed short *)0x40001000;
+  UART[0] = c;
+  for(;;);
+}

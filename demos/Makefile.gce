@@ -1,0 +1,175 @@
+GCE_ROOT       ?= $(abspath ../llvm)
+GCE_BUILD      ?= $(GCE_ROOT)/build
+BIN_DIR        := $(GCE_BUILD)/bin
+
+CLANG          := $(BIN_DIR)/clang
+LLVM_MC        := $(BIN_DIR)/llvm-mc
+LLVM_AR        := $(BIN_DIR)/llvm-ar
+LLD            := $(BIN_DIR)/ld.lld
+OBJCOPY        := $(BIN_DIR)/llvm-objcopy
+
+RUNTIME_DIR    := $(GCE_ROOT)/runtime
+BUILD_DIR      ?= build-gce
+
+GCE_BASE       ?= 0xf7600000
+GCE_CAPACITY   ?= 0x1000000
+GCE_STACK_SIZE ?= 0x10000
+OPT_LEVEL      ?= -O2
+
+COMMON_FLAGS   := -I. -Iplayback --target=gce-unknown-none -ffreestanding -fno-builtin \
+                  -fno-pic -fno-pie -fno-stack-protector -fno-unwind-tables \
+                  -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections
+
+CFLAGS         ?= $(OPT_LEVEL)
+RUNTIME_CFLAGS := $(COMMON_FLAGS) $(OPT_LEVEL) -fno-fast-math -ffp-contract=off
+
+LDFLAGS        := -m elf32gce --gc-sections \
+                  --image-base=$(GCE_BASE) \
+                  --defsym=GCE_BASE=$(GCE_BASE) \
+                  --defsym=GCE_CAPACITY=$(GCE_CAPACITY) \
+                  --defsym=GCE_STACK_SIZE=$(GCE_STACK_SIZE) \
+                  -T $(RUNTIME_DIR)/gce.ld
+
+#runtime
+BUILTIN_SRCS   := $(wildcard $(RUNTIME_DIR)/builtins/*.c)
+BUILTIN_OBJS   := $(patsubst $(RUNTIME_DIR)/builtins/%.c, $(BUILD_DIR)/runtime/builtin-%.o, $(BUILTIN_SRCS))
+
+SOFTFLOAT_NAMES := $(shell jq -r '.sources[]' $(RUNTIME_DIR)/softfloat/manifest.json 2>/dev/null || \
+                     sed -n 's/.*"\([^"]*\.c\)".*/\1/p' $(RUNTIME_DIR)/softfloat/manifest.json)
+SOFTFLOAT_OBJS  := $(patsubst %.c, $(BUILD_DIR)/runtime/softfloat-%.o, $(SOFTFLOAT_NAMES))
+
+CRT0            := $(BUILD_DIR)/runtime/crt0.o
+INDIRECT        := $(BUILD_DIR)/runtime/indirect.o
+LIBGCE          := $(BUILD_DIR)/runtime/libgce.a
+
+VPATH := playback dhrystone tetris
+
+include Makefile.video
+
+TARGETS := video.bin snake.bin cube.bin keyinput.bin tetris.bin float.bin dhrystone.bin
+all: $(TARGETS)
+
+video.elf:        $(BUILD_DIR)/video.o
+video_native.elf: $(BUILD_DIR)/video.o
+$(BUILD_DIR)/video.o: video_data.h
+snake.elf:     $(BUILD_DIR)/snake.o
+cube.elf:      $(BUILD_DIR)/cube.o
+keyinput.elf:  $(BUILD_DIR)/keyinput.o
+tetris.elf:    $(BUILD_DIR)/tetris.o
+float.elf:     $(BUILD_DIR)/float.o
+dhrystone.elf: $(BUILD_DIR)/dhry_1.o $(BUILD_DIR)/dhry_2.o
+
+video.bin:        video_data.h
+video_native.bin: video_data.h
+
+DHRY_FLAGS := -Wno-implicit-function-declaration -Wno-implicit-int \
+              -Wno-return-type -Wno-pointer-to-int-cast -std=gnu89 -DREG=register -DTIME
+$(BUILD_DIR)/dhry_1.o $(BUILD_DIR)/dhry_2.o: CFLAGS += $(DHRY_FLAGS)
+
+dhrystone.bin: $(BUILD_DIR)/dhry_1.o $(BUILD_DIR)/dhry_2.o
+video.bin:     $(BUILD_DIR)/video.o
+snake.bin:     $(BUILD_DIR)/snake.o
+cube.bin:      $(BUILD_DIR)/cube.o
+keyinput.bin:  $(BUILD_DIR)/keyinput.o
+tetris.bin:    $(BUILD_DIR)/tetris.o
+float.bin:     $(BUILD_DIR)/float.o
+
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+	$(CLANG) $(COMMON_FLAGS) $(CFLAGS) -c $< -o $@
+
+%.elf: $(CRT0) $(INDIRECT) $(LIBGCE)
+	$(LLD) $(LDFLAGS) \
+	    $(CRT0) $(INDIRECT) \
+	    $(filter-out $(CRT0) $(INDIRECT), $(filter %.o,$^)) \
+	    $(LIBGCE) \
+	    -Map=$(basename $@).map -o $@
+
+%.bin: %.elf
+	$(OBJCOPY) -O binary $< $@
+
+$(BUILD_DIR) $(BUILD_DIR)/runtime:
+	mkdir -p $@
+
+$(BUILD_DIR)/runtime/builtin-%.o: $(RUNTIME_DIR)/builtins/%.c | $(BUILD_DIR)/runtime
+	$(CLANG) $(RUNTIME_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/runtime/softfloat-extendsfdf2.o: $(RUNTIME_DIR)/softfloat-extend.c | $(BUILD_DIR)/runtime
+	$(CLANG) $(RUNTIME_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/runtime/softfloat-%.o: $(RUNTIME_DIR)/softfloat/%.c | $(BUILD_DIR)/runtime
+	$(CLANG) $(RUNTIME_CFLAGS) -c $< -o $@
+
+$(LIBGCE): $(BUILTIN_OBJS) $(SOFTFLOAT_OBJS)
+	rm -f $@
+	$(LLVM_AR) rcs $@ $^
+
+$(CRT0): $(RUNTIME_DIR)/crt0.s | $(BUILD_DIR)/runtime
+	$(LLVM_MC) -triple=gce-unknown-none -filetype=obj $< -o $@
+
+$(INDIRECT): $(RUNTIME_DIR)/indirect.s | $(BUILD_DIR)/runtime
+	$(LLVM_MC) -triple=gce-unknown-none -filetype=obj $< -o $@
+
+DOOM_DIR       := doom-gce
+DOOM_CLI       := doom-cli
+DOOMGENERIC    := $(DOOM_CLI)/doomgeneric
+
+DOOM_SRCS_NAMES := dummy am_map doomdef doomstat dstrings d_event d_items d_iwad d_loop \
+                   d_main d_mode d_net f_finale f_wipe g_game hu_lib hu_stuff info i_cdmus i_endoom \
+                   i_joystick i_scale i_sound i_system i_timer memio m_argv m_bbox m_cheat m_config \
+                   m_controls m_fixed m_menu m_misc m_random p_ceilng p_doors p_enemy p_floor p_inter \
+                   p_lights p_map p_maputl p_mobj p_plats p_pspr p_saveg p_setup p_sight p_spec \
+                   p_switch p_telept p_tick p_user r_bsp r_data r_draw r_main r_plane r_segs r_sky \
+                   r_things sha1 sounds statdump st_lib st_stuff s_sound tables v_video wi_stuff \
+                   w_checksum w_file w_main w_wad z_zone w_file_stdc i_input i_video doomgeneric \
+                   cli_data
+
+DOOM_OBJS := $(patsubst %, $(BUILD_DIR)/doom/%.o, $(DOOM_SRCS_NAMES)) \
+             $(BUILD_DIR)/doom/gce_libc.o \
+             $(BUILD_DIR)/doom/doomgeneric_gce.o \
+             $(BUILD_DIR)/doom/wad.o
+
+DOOM_CFLAGS := -DDOOMGENERIC_RESX=320 \
+               -DDOOMGENERIC_RESY=200 \
+               -DDISABLE_ZENITY \
+               -DDOOM_CLI \
+               -I$(DOOM_DIR)/include \
+               -I$(DOOMGENERIC)
+
+$(BUILD_DIR)/doom/%.o: CFLAGS += $(DOOM_CFLAGS)
+
+TARGETS += doom.bin
+
+doom.elf: $(DOOM_OBJS)
+doom.bin: doom.elf
+
+$(BUILD_DIR)/doom:
+	mkdir -p $@
+
+$(BUILD_DIR)/doom/%.o: $(DOOMGENERIC)/%.c | $(BUILD_DIR)/doom
+	$(CLANG) $(COMMON_FLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/doom/gce_libc.o: $(DOOM_DIR)/gce_libc.c | $(BUILD_DIR)/doom
+	$(CLANG) $(COMMON_FLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/doom/doomgeneric_gce.o: $(DOOM_DIR)/doomgeneric_gce.c | $(BUILD_DIR)/doom
+	$(CLANG) $(COMMON_FLAGS) $(CFLAGS) -c $< -o $@
+
+WAD_FILE := $(firstword $(wildcard $(DOOM_CLI)/DOOM1.WAD $(DOOM_CLI)/doom1.wad $(DOOM_DIR)/DOOM1.WAD $(DOOM_DIR)/doom1.wad))
+
+ifeq ($(WAD_FILE),)
+$(BUILD_DIR)/doom/wad.c:
+	$(error "Missing IWAD: DOOM1.WAD or doom1.wad not found in $(DOOM_CLI) or $(DOOM_DIR)")
+else
+# Generate wad.c only when WAD_FILE changes
+$(BUILD_DIR)/doom/wad.c: $(WAD_FILE) | $(BUILD_DIR)/doom
+	@echo "Generating $@ from $<..."
+	@printf "/* Generated from $< */\nconst unsigned char doom_wad[] = {\n" > $@
+	@od -An -tx1 -v $< | awk '{for(i=1;i<=NF;i++) printf "0x%s,", $$i; print ""}' >> $@
+	@printf "};\nconst unsigned int doom_wad_len = %u;\n" $$(stat -c %s $< 2>/dev/null || stat -f %z $<) >> $@
+endif
+
+$(BUILD_DIR)/doom/wad.o: $(BUILD_DIR)/doom/wad.c | $(BUILD_DIR)/doom
+	$(CLANG) $(COMMON_FLAGS) -O0 -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR) *.elf *.bin *.map video_data.h playback/video_data.h /tmp/frame_* $(FFMPEG_STAMP)

@@ -1,0 +1,45 @@
+CC          := riscv32-unknown-elf-gcc
+CFLAGS      := -march=rv32ima -mabi=ilp32 -nostdlib -ffreestanding -O2 -I. -Iplayback
+PYTHON      := python3
+MKBIN       := ../rv32_on_gce/mkbin.py
+BUILD_IMAGE := ../llvm/tools/build-image.py
+
+GCE_BASE    ?= 0x00000000f7600000
+RV_BASE     ?= 0xa8000000
+
+LDFLAGS     := -Wl,-Ttext=$(RV_BASE) -Wl,-e,_start
+
+VPATH       := playback dhrystone tetris
+
+include Makefile.video
+
+.PHONY: all ffmpeg_extract dhrystone clean video_native.bin
+
+all: video.bin
+
+#rv
+%.elf:
+	$(CC) $(CFLAGS) $(filter %.c,$^) -o $@ $(LDFLAGS)
+
+%.bin: %.elf
+	$(PYTHON) $(MKBIN) elf $< --gce-base $(GCE_BASE) --stack-top 0xa8a00000 -o $@
+
+dhrystone.elf: dhrystone/dhry_1.c dhrystone/dhry_2.c
+	$(CC) $(CFLAGS) $^ -o $@ -std=gnu89 -DREG=register -DTIME \
+		-Wno-implicit-function-declaration -Wno-implicit-int \
+		-Wno-return-type -Wno-pointer-to-int-cast $(LDFLAGS)
+
+video.bin video.elf: playback/video.c video_data.h shims.h
+snake.bin snake.elf: snake.c shims.h
+cube.bin cube.elf:   cube.c
+keyinput.bin keyinput.elf: keyinput.c
+tetris.bin tetris.elf: tetris/tetris.c
+float.bin float.elf: float.c
+
+video_native.bin:
+	$(MAKE) TARGET=gce video_native.bin
+
+dhrystone: dhrystone.bin
+
+clean:
+	rm -f *.elf *.bin video_data.h playback/video_data.h /tmp/frame_* $(FFMPEG_STAMP)

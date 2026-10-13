@@ -1,0 +1,23 @@
+*.elf
+*.bin
+*.proprietary.bin
+__pycache__
+target
+video_data.h
+linux/
+u-boot/
+buildroot/
+llvm-project/
+busybox/
+*.WAD
+build-gce/
+build-riscv/
+*.map
+wad.c
+*.o
+
+# proprietary and confidential
+
+llvm/build
+llvm/examples
+llvm/tools

@@ -1,0 +1,24 @@
+PYTHON       ?= python3
+COLS         ?= 80
+ROWS         ?= 24
+FPS          ?= 30
+VIDEO_FLAGS  ?=
+
+VIDEO        ?= $(HOME)/animation.gif.mp4
+FFMPEG_STAMP ?= /tmp/.ffmpeg_extract.stamp
+
+$(FFMPEG_STAMP): $(wildcard $(VIDEO))
+	@if [ -f "$<" ]; then \
+		ffmpeg -y -i $< -vf fps=$(FPS) /tmp/frame_%04d.png && touch $@; \
+	elif [ -f /tmp/frame_0001.png ]; then \
+		echo "Using existing /tmp/frame_*.png"; \
+		touch $@; \
+	else \
+		echo "Error: Video file '$(VIDEO)' not found and no frames in /tmp/frame_*.png" >&2; \
+		exit 1; \
+	fi
+
+ffmpeg_extract: $(FFMPEG_STAMP)
+
+video_data.h: playback/gen_video.py $(FFMPEG_STAMP)
+	$(PYTHON) $< --pattern "/tmp/frame_*.png" --cols $(COLS) --rows $(ROWS) --fps $(FPS) $(VIDEO_FLAGS) -o $@ --braille
