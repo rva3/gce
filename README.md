@@ -39,6 +39,8 @@ patches) and U-Boot.
 You're not allowed to ask if this is useful. If such question appears, you will be banned on this
 repository forever.
 
+***YouTube demo: https://youtu.be/OzFfuF31w54***
+
 ## FAQ
 ### Is there ISA description?
 Yes. Check ISA.md file.
