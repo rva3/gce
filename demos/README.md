@@ -45,11 +45,9 @@ in sponsoring our work, please open an issue.
 
 ### Build
 You can use RISC-V or native GCE versions. GCE code reaches up to 5.4 DMIPS, while RISC-V is 0.4
-DMIPS. Moreover, some demos, such as DOOM or native video playback, require only native code.
+DMIPS. Moreover, some demos, such as DOOM or native video playback, are available only native code.
 
 To build demos you need something like `make TARGET=riscv cube.bin` or `make TARGET=gce cube.bin`.
-Because we're not paid for cleaning up mess, some targets, such as `video_native.bin` require
-`TARGET=riscv` due to historical reasons.
 
 To run the doom you will need to download DOOM1.WAD and use `make TARGET=gce doom.bin`.
 

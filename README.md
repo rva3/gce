@@ -26,7 +26,7 @@ Please make sure to check out each component README file for better understandin
 
 ## License
 Our in-house code is licensed under [AGPLv3](./LICENSE.agpl), documentation (including markdown files) -
-under [CC BY NC SA 4.0](./LICENSE.cc). Some demos have their own code, please make sure to check
+under [CC BY NC SA 4.0](./LICENSE.cc). Some demos have their own license, please make sure to check
 demos/ directory. Linux kernel patch (drv.diff) is licensed under GPLv2.
 
 ## So what?
